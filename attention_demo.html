@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="utf-8" />
+  <title>坐姿平衡检测 — 最终版（零位校准+偏移指示器）</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background:#f6f7fb; color:#111; margin:12px; }
+    #wrap { max-width:1100px; margin:0 auto; text-align:center; }
+    .video-container {
+      position: relative;
+      width: 720px;
+      height: 540px;
+      margin: 0 auto;
+      border: 1px solid #ccc;
+      background: #000;
+    }
+    video, canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    canvas { pointer-events: none; }
+    #status { margin-top:10px; font-weight:700; }
+    #controls { margin-top:12px; }
+    button { padding:8px 14px; font-size:14px; margin:0 6px; cursor:pointer; }
+    #log { margin-top:12px; max-height:360px; overflow:auto; text-align:left; width:100%; border:1px solid #e6e6e6; padding:10px; font-size:12px; background:#fff; box-sizing:border-box; }
+    #debug { margin-top:12px; display:flex; gap:12px; justify-content:center; flex-wrap:wrap; }
+    .dbg { background:#fff; border:1px solid #eee; padding:10px; min-width:240px; text-align:left; font-size:13px; box-sizing:border-box; }
+    .label { color:#666; font-size:12px; margin-bottom:6px; display:block; }
+    .small { font-size:12px; color:#666; margin-top:8px; }
+    #overlayMsg { font-size:22px; color:#800; font-weight:700; text-shadow:0 1px 0 #fff; }
+    .log-line { border-bottom:1px dashed #f0f0f0; padding:6px 0; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <h2>坐姿平衡检测（带零位校准）</h2>
+
+    <div class="video-container">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="canvasOverlay" width="720" height="540"></canvas>
+    </div>
+
+    <div id="status">未启动检测</div>
+
+    <div id="controls">
+      <button id="startBtn">Start</button>
+      <button id="stopBtn" disabled>Stop</button>
+      <button id="calibrateBtn" disabled>校准当前姿态</button>
+      <button id="resetCalibBtn" disabled>重置校准</button>
+      <button id="testAlertBtn">Test Alert</button>
+      <button id="testAudioBtn">Test Audio</button>
+      <button id="testCameraBtn">Test Camera Only</button>
+      <button id="copyLogBtn">Copy Logs</button>
+      <label style="margin-left:8px;"><input type="checkbox" id="perFrameVerbose"> 每帧详细日志</label>
+      <label style="margin-left:8px;"><input type="checkbox" id="showGuide" checked> 显示参考线</label>
+    </div>
+
+    <div class="small">
+      <strong>使用说明：</strong><br>
+      1. 点击 Start 启动摄像头。<br>
+      2. 坐端正，面对摄像头，然后点击 <strong>“校准当前姿态”</strong> 记录基准。<br>
+      3. 之后系统会检测您是否偏离基准（超过阈值则报警）。<br>
+      4. 若摄像头移动，请重新校准。<br>
+      当前阈值：yaw=20°, pitch=25°, roll=15°（相对于基准）。
+    </div>
+
+    <div id="debug" aria-hidden="false">
+      <div class="dbg">
+        <span class="label">Audio</span>
+        <div id="dbgAudio">AudioContext: -</div>
+        <div id="dbgAudioMuted">Tab muted flag: -</div>
+      </div>
+      <div class="dbg">
+        <span class="label">Permissions & Page</span>
+        <div id="dbgNotif">Notification: -</div>
+        <div id="dbgCamera">Camera stream: -</div>
+        <div id="dbgFocus">Document focus: -</div>
+      </div>
+      <div class="dbg">
+        <span class="label">Detection</span>
+        <div id="dbgFaceCount">Face present: -</div>
+        <div id="dbgPose">Yaw/Pitch/Roll: -</div>
+        <div id="dbgBaseline">基准: 未校准</div>
+      </div>
+      <div class="dbg">
+        <span class="label">Counters</span>
+        <div id="dbgChecks">Frames checked: 0</div>
+        <div id="dbgAlerts">Alerts triggered: 0</div>
+      </div>
+    </div>
+
+    <div id="log" aria-live="polite"></div>
+  </div>
+
+  <!-- 覆盖层（提醒时显示） -->
+  <div id="attentionOverlay" style="position:fixed; left:0; top:0; width:100%; height:100%; display:none; align-items:center; justify-content:center; background:rgba(255,0,0,0.18); z-index:999999; pointer-events:none;">
+    <div id="overlayMsg" style="font-size:26px; color:#800; font-weight:700; text-shadow:0 1px 0 #fff;">检测到坐姿偏离，请回到屏幕前端正坐姿</div>
+  </div>
+
+  <!-- MediaPipe 库 -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/face_mesh.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js"></script>
+
+  <script>
+  (function(){
+    // 检查库是否加载成功
+    if (typeof FaceMesh === 'undefined') {
+      alert('错误：MediaPipe FaceMesh 库未加载，请检查网络或刷新重试。');
+      return;
+    }
+    if (typeof Camera === 'undefined') {
+      alert('错误：MediaPipe CameraUtils 库未加载，请检查网络或刷新重试。');
+      return;
+    }
+
+    // --- 可调阈值 ---
+    const MISSING_FACE_THRESHOLD_MS = 1200;
+    const YAW_THRESHOLD_DEG = 20;
+    const PITCH_THRESHOLD_DEG = 25;   // 适应自然低头
+    const ROLL_THRESHOLD_DEG = 15;
+    const OFFSCREEN_DURATION_MS = 800;
+    const ALERT_COOLDOWN_MS = 5000;    // 5秒内只触发一次
+
+    // --- DOM 元素 ---
+    const video = document.getElementById('video');
+    const canvasOverlay = document.getElementById('canvasOverlay');
+    const ctxOverlay = canvasOverlay.getContext('2d');
+    const status = document.getElementById('status');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const calibrateBtn = document.getElementById('calibrateBtn');
+    const resetCalibBtn = document.getElementById('resetCalibBtn');
+    const testAlertBtn = document.getElementById('testAlertBtn');
+    const testAudioBtn = document.getElementById('testAudioBtn');
+    const testCameraBtn = document.getElementById('testCameraBtn');
+    const copyLogBtn = document.getElementById('copyLogBtn');
+    const perFrameVerboseCheckbox = document.getElementById('perFrameVerbose');
+    const showGuideCheckbox = document.getElementById('showGuide');
+
+    const dbgAudio = document.getElementById('dbgAudio');
+    const dbgAudioMuted = document.getElementById('dbgAudioMuted');
+    const dbgNotif = document.getElementById('dbgNotif');
+    const dbgCamera = document.getElementById('dbgCamera');
+    const dbgFocus = document.getElementById('dbgFocus');
+    const dbgFaceCount = document.getElementById('dbgFaceCount');
+    const dbgPose = document.getElementById('dbgPose');
+    const dbgBaseline = document.getElementById('dbgBaseline');
+    const dbgChecks = document.getElementById('dbgChecks');
+    const dbgAlerts = document.getElementById('dbgAlerts');
+    const overlayDiv = document.getElementById('attentionOverlay');
+    const logDiv = document.getElementById('log');
+
+    // --- 状态 ---
+    let camera = null;
+    let faceMesh = null;
+    let running = false;
+    let lastFaceSeen = null;
+    let offscreenStart = null;
+    let checksCount = 0;
+    let alertsCount = 0;
+    let audioCtx = null;
+    let lastAlertTime = 0;
+    let lastPose = null;          // 最近一次检测到的姿态
+    let baseline = null;          // 校准基准 { yaw, pitch, roll }
+
+    // --- 日志与调试 ---
+    function nowStr(){ return new Date().toLocaleTimeString(); }
+    function appendLog(s, level='info'){
+      const line = `[${nowStr()}] ${s}`;
+      const div = document.createElement('div');
+      div.className = 'log-line';
+      div.textContent = line;
+      logDiv.insertBefore(div, logDiv.firstChild);
+      while (logDiv.childElementCount > 800) logDiv.removeChild(logDiv.lastChild);
+      if (level === 'error') console.error(line); else if (level === 'warn') console.warn(line); else console.log(line);
+    }
+    function updateDebug(present, yaw, pitch, roll){
+      dbgAudio.textContent = 'AudioContext: ' + ((audioCtx && audioCtx.state) ? audioCtx.state : 'none');
+      dbgAudioMuted.textContent = 'Tab muted flag: ' + (video.muted ? 'true' : 'false');
+      dbgNotif.textContent = 'Notification: ' + (("Notification" in window) ? Notification.permission : 'unsupported');
+      dbgCamera.textContent = (video.srcObject && video.srcObject.active) ? 'active' : 'inactive';
+      dbgFocus.textContent = 'Document focus: ' + (document.hasFocus() ? 'foreground' : 'background');
+      dbgFaceCount.textContent = 'Face present: ' + (present ? 'yes' : 'no');
+      dbgPose.textContent = yaw !== null ? `Yaw ${yaw.toFixed(1)}°, Pitch ${pitch.toFixed(1)}°, Roll ${roll.toFixed(1)}°` : '-';
+      if (baseline) {
+        dbgBaseline.textContent = `基准: Yaw ${baseline.yaw.toFixed(1)}°, Pitch ${baseline.pitch.toFixed(1)}°, Roll ${baseline.roll.toFixed(1)}°`;
+      } else {
+        dbgBaseline.textContent = '基准: 未校准';
+      }
+      dbgChecks.textContent = 'Frames checked: ' + checksCount;
+      dbgAlerts.textContent = 'Alerts triggered: ' + alertsCount;
+    }
+
+    // --- 音频 ---
+    async function ensureAudioCtx(){
+      try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+        return true;
+      } catch(e){
+        console.warn('ensureAudioCtx failed', e);
+        return false;
+      }
+    }
+    async function playBeep(){
+      try {
+        const ok = await ensureAudioCtx();
+        if (!ok) throw new Error('AudioContext unavailable');
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.type = 'sine';
+        o.frequency.value = 880;
+        g.gain.value = 0.06;
+        o.connect(g);
+        g.connect(audioCtx.destination);
+        o.start();
+        setTimeout(()=>{ try{ o.stop(); }catch(e){} }, 140);
+        appendLog('playBeep: oscillator played');
+      } catch(e){
+        appendLog('playBeep: AudioContext failed, fallback to Audio element: ' + (e && e.message), 'warn');
+        try {
+          const a = new Audio("data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=");
+          a.volume = 0.6;
+          a.play().then(()=> appendLog('playBeep: fallback audio played')).catch(err => appendLog('playBeep fallback blocked: ' + err, 'warn'));
+        } catch(err){
+          appendLog('playBeep: fallback failed: ' + err, 'error');
+        }
+      }
+    }
+
+    function tryNotify(title, body){
+      if (!("Notification" in window)) { appendLog('Notifications unsupported', 'warn'); return false; }
+      if (Notification.permission === 'granted') {
+        try { new Notification(title, { body, silent: true }); appendLog('Notification sent'); return true; } catch(e){ appendLog('Notification error: ' + e, 'warn'); return false; }
+      } else {
+        appendLog('Notification permission: ' + Notification.permission, 'warn');
+      }
+      return false;
+    }
+
+    function showOverlay(ms=2500){
+      overlayDiv.style.display = 'flex';
+      setTimeout(()=> overlayDiv.style.display = 'none', ms);
+    }
+
+    function triggerAlert(reason){
+      const now = Date.now();
+      if (now - lastAlertTime < ALERT_COOLDOWN_MS) {
+        appendLog(`triggerAlert 被忽略（冷却中，距离上次 ${now - lastAlertTime} ms）`);
+        return;
+      }
+      lastAlertTime = now;
+
+      alertsCount++;
+      appendLog('triggerAlert: ' + reason);
+      showOverlay(3000);
+      playBeep();
+      tryNotify('坐姿提醒', '检测到坐姿偏离，请端正坐姿。');
+      updateDebug(true, null, null, null);
+    }
+
+    // --- 头部姿态估计 ---
+    function estimateHeadPose(landmarks, width, height){
+      const idxNose = 1, idxLeft = 33, idxRight = 263;
+      if (!landmarks[idxNose] || !landmarks[idxLeft] || !landmarks[idxRight]) return null;
+      const pN = landmarks[idxNose];
+      const pL = landmarks[idxLeft];
+      const pR = landmarks[idxRight];
+      const xN = pN.x * width, yN = pN.y * height;
+      const xL = pL.x * width, yL = pL.y * height;
+      const xR = pR.x * width, yR = pR.y * height;
+      const vx = (xR - xL);
+      const vy = (yR - yL);
+      const interEye = Math.hypot(vx, vy) || 1;
+      const eyeMidX = (xL + xR) / 2;
+      const eyeMidY = (yL + yR) / 2;
+      const dx = xN - eyeMidX;
+      const dy = yN - eyeMidY;
+      const yaw = Math.atan2(dx, interEye) * (180/Math.PI);
+      const pitch = Math.atan2(dy, interEye) * (180/Math.PI);
+      const roll = Math.atan2(vy, vx) * (180/Math.PI);
+      return { yaw, pitch, roll };
+    }
+
+    // --- 绘制关键点 + 参考线 + 偏移指示器 + 基准信息 ---
+    function drawResults(landmarks, width, height, pose){
+      ctxOverlay.clearRect(0,0,canvasOverlay.width, canvasOverlay.height);
+
+      if (showGuideCheckbox.checked) {
+        ctxOverlay.strokeStyle = 'rgba(255,255,255,0.5)';
+        ctxOverlay.lineWidth = 1;
+        ctxOverlay.beginPath();
+        ctxOverlay.moveTo(width/2, 0);
+        ctxOverlay.lineTo(width/2, height);
+        ctxOverlay.stroke();
+        ctxOverlay.beginPath();
+        ctxOverlay.moveTo(0, height/2);
+        ctxOverlay.lineTo(width, height/2);
+        ctxOverlay.stroke();
+
+        ctxOverlay.strokeStyle = 'rgba(0,255,0,0.4)';
+        ctxOverlay.lineWidth = 2;
+        ctxOverlay.strokeRect(width*0.3, height*0.2, width*0.4, height*0.6);
+      }
+
+      if (!landmarks) return;
+
+      const nose = landmarks[1];
+      const noseX = nose.x * width;
+      const noseY = nose.y * height;
+
+      ctxOverlay.beginPath();
+      ctxOverlay.arc(noseX, noseY, 4, 0, Math.PI*2);
+      ctxOverlay.fillStyle = 'rgba(255,0,0,0.9)';
+      ctxOverlay.fill();
+
+      const left = landmarks[33], right = landmarks[263];
+      ctxOverlay.fillStyle = 'rgba(0,150,255,0.9)';
+      ctxOverlay.beginPath(); ctxOverlay.arc(left.x*width, left.y*height, 3,0,Math.PI*2); ctxOverlay.fill();
+      ctxOverlay.beginPath(); ctxOverlay.arc(right.x*width, right.y*height, 3,0,Math.PI*2); ctxOverlay.fill();
+
+      if (pose) {
+        ctxOverlay.fillStyle = 'rgba(0,0,0,0.6)';
+        ctxOverlay.fillRect(6,6,280,95);
+        ctxOverlay.fillStyle = '#fff';
+        ctxOverlay.font = '12px monospace';
+        ctxOverlay.fillText(`Yaw ${pose.yaw.toFixed(1)}°`, 12, 24);
+        ctxOverlay.fillText(`Pitch ${pose.pitch.toFixed(1)}°`, 12, 40);
+        ctxOverlay.fillText(`Roll ${pose.roll.toFixed(1)}°`, 12, 56);
+
+        const offsetX = ((noseX - width/2) / (width/2)) * 100;
+        const offsetY = ((noseY - height/2) / (height/2)) * 100;
+        ctxOverlay.fillText(`偏移 X ${offsetX.toFixed(1)}%  Y ${offsetY.toFixed(1)}%`, 12, 74);
+
+        if (baseline) {
+          ctxOverlay.fillText(`基准 Y ${baseline.yaw.toFixed(1)} P ${baseline.pitch.toFixed(1)} R ${baseline.roll.toFixed(1)}`, 12, 92);
+        } else {
+          ctxOverlay.fillText(`基准 未校准`, 12, 92);
+        }
+      }
+    }
+
+    // --- MediaPipe 初始化 ---
+    function setupFaceMesh(){
+      faceMesh = new FaceMesh({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/${file}`
+      });
+      faceMesh.setOptions({
+        maxNumFaces: 1,
+        refineLandmarks: false,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      });
+      faceMesh.onResults(onResults);
+    }
+
+    // --- onResults 回调（核心检测逻辑，使用基准）---
+    function onResults(results){
+      checksCount++;
+      const width = canvasOverlay.width;
+      const height = canvasOverlay.height;
+      let present = false;
+      let pose = null;
+
+      if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+        present = true;
+        const landmarks = results.multiFaceLandmarks[0];
+        pose = estimateHeadPose(landmarks, width, height);
+        lastPose = pose; // 更新 lastPose 供校准使用
+        drawResults(landmarks, width, height, pose);
+        lastFaceSeen = Date.now();
+      } else {
+        drawResults(null, width, height, null);
+      }
+
+      const now = Date.now();
+
+      if (!present) {
+        const since = lastFaceSeen ? (now - lastFaceSeen) : Infinity;
+        if (since > MISSING_FACE_THRESHOLD_MS) {
+          appendLog('无人脸超时，触发警报');
+          triggerAlert('missing_face_threshold');
+          lastFaceSeen = now;
+        }
+      } else {
+        if (pose) {
+          // 如果有基准，计算差值；否则直接使用原始值
+          let deltaYaw = pose.yaw;
+          let deltaPitch = pose.pitch;
+          let deltaRoll = pose.roll;
+          if (baseline) {
+            deltaYaw = pose.yaw - baseline.yaw;
+            deltaPitch = pose.pitch - baseline.pitch;
+            deltaRoll = pose.roll - baseline.roll;
+          }
+          const outOfBounds = Math.abs(deltaYaw) > YAW_THRESHOLD_DEG ||
+                              Math.abs(deltaPitch) > PITCH_THRESHOLD_DEG ||
+                              Math.abs(deltaRoll) > ROLL_THRESHOLD_DEG;
+          if (outOfBounds) {
+            if (!offscreenStart) offscreenStart = now;
+            const dur = now - offscreenStart;
+            if (dur > OFFSCREEN_DURATION_MS) {
+              appendLog('姿态异常超时，触发警报');
+              triggerAlert('offscreen_duration');
+              offscreenStart = now;
+            }
+          } else {
+            offscreenStart = null;
+          }
+        }
+      }
+
+      updateDebug(present, pose ? pose.yaw : null, pose ? pose.pitch : null, pose ? pose.roll : null);
+
+      if (perFrameVerboseCheckbox.checked) {
+        console.debug('frame', { checksCount, present, pose, baseline });
+      }
+    }
+
+    // --- 校准功能 ---
+    function calibrate() {
+      if (!running) {
+        appendLog('校准失败：检测未运行', 'warn');
+        return;
+      }
+      if (!lastFaceSeen || (Date.now() - lastFaceSeen > 1000)) {
+        appendLog('校准失败：当前未检测到人脸或人脸已丢失', 'warn');
+        return;
+      }
+      if (!lastPose) {
+        appendLog('校准失败：尚未获取到有效的姿态数据', 'warn');
+        return;
+      }
+      baseline = { ...lastPose };
+      appendLog(`校准完成：基准 Yaw=${baseline.yaw.toFixed(1)}°, Pitch=${baseline.pitch.toFixed(1)}°, Roll=${baseline.roll.toFixed(1)}°`);
+      updateDebug(true, lastPose.yaw, lastPose.pitch, lastPose.roll);
+    }
+
+    function resetCalibration() {
+      baseline = null;
+      appendLog('校准已重置');
+      updateDebug(false, null, null, null);
+    }
+
+    // --- 摄像头启动 ---
+    async function startCamera(onlyTest = false){
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { width: 720, height: 540 }, 
+          audio: false 
+        });
+        video.srcObject = stream;
+        await new Promise((resolve) => {
+          video.onloadedmetadata = () => {
+            canvasOverlay.width = video.videoWidth || 720;
+            canvasOverlay.height = video.videoHeight || 540;
+            appendLog(`视频尺寸: ${canvasOverlay.width} x ${canvasOverlay.height}`);
+            resolve();
+          };
+        });
+        await video.play();
+        appendLog('视频播放已启动');
+
+        if (onlyTest) {
+          status.textContent = '摄像头测试成功，你应该能看到自己的脸。';
+          appendLog('摄像头测试成功，视频正在显示');
+          return stream;
+        } else {
+          camera = new Camera(video, {
+            onFrame: async () => {
+              if (faceMesh) await faceMesh.send({ image: video });
+            },
+            width: 720,
+            height: 540
+          });
+          camera.start();
+          appendLog('摄像头 + MediaPipe 已启动');
+          return stream;
+        }
+      } catch(e) {
+        const errMsg = `摄像头启动失败: ${e.name} - ${e.message}`;
+        appendLog(errMsg, 'error');
+        status.textContent = errMsg;
+        throw e;
+      }
+    }
+
+    // --- 整体检测启动 ---
+    async function startDetection(){
+      if (running) return;
+      try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+        if ("Notification" in window && Notification.permission === "default") {
+          await Notification.requestPermission();
+        }
+
+        setupFaceMesh();
+        await startCamera(false);
+
+        running = true;
+        lastFaceSeen = Date.now();
+        offscreenStart = null;
+        checksCount = 0;
+        alertsCount = 0;
+        lastAlertTime = 0;
+        baseline = null; // 重置校准
+        lastPose = null;
+        status.textContent = '检测已启动，请坐端正后点击“校准当前姿态”';
+        appendLog('检测启动，阈值：yaw=' + YAW_THRESHOLD_DEG + '°, pitch=' + PITCH_THRESHOLD_DEG + '°, roll=' + ROLL_THRESHOLD_DEG + '°, 警报冷却=' + (ALERT_COOLDOWN_MS/1000) + '秒');
+        updateDebug(false, null, null, null);
+
+        calibrateBtn.disabled = false;
+        resetCalibBtn.disabled = false;
+      } catch (err) {
+        status.textContent = '启动失败，请查看日志';
+        appendLog('启动过程中发生错误: ' + err, 'error');
+      }
+    }
+
+    function stopDetection(){
+      if (!running) return;
+      running = false;
+      try { if (camera) camera.stop(); } catch(e){}
+      camera = null;
+      if (video && video.srcObject) {
+        video.srcObject.getTracks().forEach(t => t.stop());
+        video.srcObject = null;
+      }
+      if (faceMesh) { try { faceMesh.close(); } catch(e){} }
+      status.textContent = '检测已停止';
+      appendLog('检测停止');
+      updateDebug(false, null, null, null);
+      calibrateBtn.disabled = true;
+      resetCalibBtn.disabled = true;
+    }
+
+    // --- 仅测试摄像头 ---
+    async function testCameraOnly() {
+      stopDetection();
+      try {
+        await startCamera(true);
+      } catch (e) {}
+    }
+
+    // --- 按钮事件绑定 ---
+    startBtn.addEventListener('click', async () => {
+      await startDetection();
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+    });
+    stopBtn.addEventListener('click', () => {
+      stopDetection();
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    });
+    calibrateBtn.addEventListener('click', calibrate);
+    resetCalibBtn.addEventListener('click', resetCalibration);
+    testAlertBtn.addEventListener('click', () => {
+      appendLog('手动测试警报');
+      triggerAlert('manual_test');
+    });
+    testAudioBtn.addEventListener('click', async () => {
+      appendLog('手动测试音频');
+      await playBeep();
+    });
+    testCameraBtn.addEventListener('click', async () => {
+      await testCameraOnly();
+    });
+    copyLogBtn.addEventListener('click', async () => {
+      try {
+        const text = Array.from(logDiv.children).map(n => n.textContent).reverse().join('\n');
+        await navigator.clipboard.writeText(text);
+        appendLog('日志已复制到剪贴板');
+      } catch(e) {
+        appendLog('复制失败: ' + e, 'warn');
+      }
+    });
+
+    // 暴露调试接口
+    window.getDebugState = () => ({
+      audioCtxState: (audioCtx && audioCtx.state) || 'none',
+      notification: (("Notification" in window) ? Notification.permission : 'unsupported'),
+      streamActive: !!(video.srcObject && video.srcObject.active),
+      lastFaceSeen,
+      offscreenStart,
+      alertsCount,
+      checksCount,
+      docFocus: document.hasFocus(),
+      baseline
+    });
+
+    // 初始日志
+    appendLog('页面就绪。新增零位校准功能，请先启动检测后校准。');
+    updateDebug(false, null, null, null);
+  })();
+  </script>
+</body>
+</html>
