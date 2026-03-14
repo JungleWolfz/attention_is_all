@@ -2,7 +2,7 @@
 <html lang="zh-Hans">
 <head>
   <meta charset="utf-8" />
-  <title>坐姿平衡检测 — 最终版（零位校准+偏移指示器）</title>
+  <title>坐姿平衡检测 — 绝对轴线报警（6秒重复+增强遮挡）</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
     body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background:#f6f7fb; color:#111; margin:12px; }
@@ -38,7 +38,7 @@
 </head>
 <body>
   <div id="wrap">
-    <h2>坐姿平衡检测（带零位校准）</h2>
+    <h2>坐姿平衡检测（绝对轴线报警 6s重复+增强遮挡）</h2>
 
     <div class="video-container">
       <video id="video" autoplay playsinline muted></video>
@@ -63,10 +63,13 @@
     <div class="small">
       <strong>使用说明：</strong><br>
       1. 点击 Start 启动摄像头。<br>
-      2. 坐端正，面对摄像头，然后点击 <strong>“校准当前姿态”</strong> 记录基准。<br>
-      3. 之后系统会检测您是否偏离基准（超过阈值则报警）。<br>
-      4. 若摄像头移动，请重新校准。<br>
-      当前阈值：yaw=20°, pitch=25°, roll=15°（相对于基准）。
+      2. 坐端正，面对摄像头（可选：点击“校准当前姿态”记录基准，用于头部角度检测）。<br>
+      3. 之后系统会检测：<br>
+      &nbsp;&nbsp;- 头部角度（yaw/pitch/roll）相对于基准的变化（阈值：20°/25°/15°，持续0.8秒）<br>
+      &nbsp;&nbsp;- <strong>眼睛连线与水平线夹角、鼻梁到下巴连线与垂直线夹角（阈值：±2.7°，立即报警）</strong><br>
+      &nbsp;&nbsp;- 离开屏幕：无人脸超过1.2秒触发警报。<br>
+      &nbsp;&nbsp;- <strong>面部遮挡：检测鼻尖、下巴、上下嘴唇、左右嘴角、左右鼻孔共8点，任一缺失立即报警</strong><br>
+      4. 所有异常都会持续提醒（每6秒重复），直到您恢复端正。
     </div>
 
     <div id="debug" aria-hidden="false">
@@ -119,12 +122,42 @@
     }
 
     // --- 可调阈值 ---
-    const MISSING_FACE_THRESHOLD_MS = 1200;
+    // 离开屏幕阈值
+    const MISSING_FACE_THRESHOLD_MS = 1200;    // 无人脸超过1.2秒触发
+
+    // 原始姿态阈值（相对于基准）—— 仍保留
     const YAW_THRESHOLD_DEG = 20;
-    const PITCH_THRESHOLD_DEG = 25;   // 适应自然低头
+    const PITCH_THRESHOLD_DEG = 25;
     const ROLL_THRESHOLD_DEG = 15;
-    const OFFSCREEN_DURATION_MS = 800;
-    const ALERT_COOLDOWN_MS = 5000;    // 5秒内只触发一次
+    const POSE_OFF_DURATION_MS = 800;          // 姿态异常持续0.8秒触发
+
+    // 中轴线和水平线阈值（绝对角度，相对于理想水平/垂直线）
+    const VERTICAL_AXIS_THRESHOLD_DEG = 2.7;    // 中轴倾角偏差绝对值
+    const HORIZONTAL_AXIS_THRESHOLD_DEG = 2.7;  // 水平线倾角偏差绝对值
+    // 轴线不再需要持续时间，立即报警
+
+    // 重复提醒间隔（改为6秒，用户要求吉利数字）
+    const REPEAT_ALERT_INTERVAL_MS = 6000;      // 6秒
+
+    // --- 关键点索引（MediaPipe Face Mesh）---
+    // 用于遮挡检测的关键点（增加鼻孔、嘴角等）
+    const OCCLUSION_POINTS = [
+      1,    // 鼻尖
+      152,  // 下巴
+      13,   // 上嘴唇
+      14,   // 下嘴唇
+      61,   // 左嘴角
+      291,  // 右嘴角
+      2,    // 左鼻孔
+      19    // 右鼻孔
+    ];
+
+    // 用于姿态估计和中轴线的标准点
+    const IDX_NOSE = 1;
+    const IDX_LEFT_EYE_OUTER = 33;
+    const IDX_RIGHT_EYE_OUTER = 263;
+    const IDX_NOSE_BRIDGE = 168;
+    const IDX_CHIN = 152;
 
     // --- DOM 元素 ---
     const video = document.getElementById('video');
@@ -159,14 +192,25 @@
     let camera = null;
     let faceMesh = null;
     let running = false;
-    let lastFaceSeen = null;
-    let offscreenStart = null;
+    let lastFaceSeen = null;            // 最后一次检测到人脸的时间
+    let poseOffStart = null;             // 姿态异常开始时间
     let checksCount = 0;
     let alertsCount = 0;
     let audioCtx = null;
-    let lastAlertTime = 0;
-    let lastPose = null;          // 最近一次检测到的姿态
-    let baseline = null;          // 校准基准 { yaw, pitch, roll }
+    // 记录上一次提醒的时间（用于重复提醒）
+    let lastPoseAlertTime = 0;
+    let lastAxisAlertTime = 0;           // 轴线报警独立计时
+    let lastMissingFaceAlertTime = 0;
+    let lastOcclusionAlertTime = 0;      // 遮挡提醒
+
+    // 最近一次检测到的数据（供校准使用）
+    let lastPose = null;                 // { yaw, pitch, roll }
+
+    // 校准基准（仅用于姿态角度）
+    let baseline = null;                 // { yaw, pitch, roll }
+
+    // 遮挡状态
+    let occlusionActive = false;          // 当前是否处于遮挡状态（用于避免重复触发）
 
     // --- 日志与调试 ---
     function nowStr(){ return new Date().toLocaleTimeString(); }
@@ -248,29 +292,43 @@
       setTimeout(()=> overlayDiv.style.display = 'none', ms);
     }
 
-    function triggerAlert(reason){
+    // 增强的触发函数：基于状态持续提醒
+    function triggerAlert(reason, type) {
       const now = Date.now();
-      if (now - lastAlertTime < ALERT_COOLDOWN_MS) {
-        appendLog(`triggerAlert 被忽略（冷却中，距离上次 ${now - lastAlertTime} ms）`);
-        return;
+      let lastAlertTimeVar;
+      if (type === 'pose') lastAlertTimeVar = lastPoseAlertTime;
+      else if (type === 'axis') lastAlertTimeVar = lastAxisAlertTime;
+      else if (type === 'missing') lastAlertTimeVar = lastMissingFaceAlertTime;
+      else if (type === 'occlusion') lastAlertTimeVar = lastOcclusionAlertTime;
+      else lastAlertTimeVar = 0;
+
+      // 检查是否需要触发（首次或超过重复间隔）
+      if (now - lastAlertTimeVar < REPEAT_ALERT_INTERVAL_MS) {
+        appendLog(`${reason} 提醒被忽略（距上次提醒 ${now - lastAlertTimeVar} ms，重复间隔 ${REPEAT_ALERT_INTERVAL_MS} ms）`);
+        return false;
       }
-      lastAlertTime = now;
+
+      // 更新对应类型的最后提醒时间
+      if (type === 'pose') lastPoseAlertTime = now;
+      else if (type === 'axis') lastAxisAlertTime = now;
+      else if (type === 'missing') lastMissingFaceAlertTime = now;
+      else if (type === 'occlusion') lastOcclusionAlertTime = now;
 
       alertsCount++;
-      appendLog('triggerAlert: ' + reason);
+      appendLog(`triggerAlert: ${reason}`);
       showOverlay(3000);
       playBeep();
-      tryNotify('坐姿提醒', '检测到坐姿偏离，请端正坐姿。');
+      tryNotify('坐姿提醒', reason);
       updateDebug(true, null, null, null);
+      return true;
     }
 
-    // --- 头部姿态估计 ---
+    // --- 头部姿态估计（三点法）---
     function estimateHeadPose(landmarks, width, height){
-      const idxNose = 1, idxLeft = 33, idxRight = 263;
-      if (!landmarks[idxNose] || !landmarks[idxLeft] || !landmarks[idxRight]) return null;
-      const pN = landmarks[idxNose];
-      const pL = landmarks[idxLeft];
-      const pR = landmarks[idxRight];
+      if (!landmarks[IDX_NOSE] || !landmarks[IDX_LEFT_EYE_OUTER] || !landmarks[IDX_RIGHT_EYE_OUTER]) return null;
+      const pN = landmarks[IDX_NOSE];
+      const pL = landmarks[IDX_LEFT_EYE_OUTER];
+      const pR = landmarks[IDX_RIGHT_EYE_OUTER];
       const xN = pN.x * width, yN = pN.y * height;
       const xL = pL.x * width, yL = pL.y * height;
       const xR = pR.x * width, yR = pR.y * height;
@@ -287,10 +345,44 @@
       return { yaw, pitch, roll };
     }
 
-    // --- 绘制关键点 + 参考线 + 偏移指示器 + 基准信息 ---
-    function drawResults(landmarks, width, height, pose){
+    // --- 计算中轴倾角（与垂直方向的夹角）和水平线倾角（与水平方向的夹角）---
+    function computeAxisAngles(landmarks, width, height){
+      if (!landmarks[IDX_NOSE_BRIDGE] || !landmarks[IDX_CHIN] || !landmarks[IDX_LEFT_EYE_OUTER] || !landmarks[IDX_RIGHT_EYE_OUTER]) {
+        return { vertical: null, horizontal: null };
+      }
+      const nb = landmarks[IDX_NOSE_BRIDGE];
+      const chin = landmarks[IDX_CHIN];
+      const leftEye = landmarks[IDX_LEFT_EYE_OUTER];
+      const rightEye = landmarks[IDX_RIGHT_EYE_OUTER];
+
+      // 中轴线向量 (从鼻梁到下巴)
+      const vxVert = (chin.x - nb.x) * width;
+      const vyVert = (chin.y - nb.y) * height;
+      // 与垂直方向(0,1)的夹角：atan2(vx, vy) 得到与垂直方向的偏角（向右为正）
+      const verticalAngle = Math.atan2(vxVert, vyVert) * 180 / Math.PI;
+
+      // 水平线向量 (左眼到右眼)
+      const vxHoriz = (rightEye.x - leftEye.x) * width;
+      const vyHoriz = (rightEye.y - leftEye.y) * height;
+      // 与水平方向(1,0)的夹角：atan2(vy, vx) 得到与水平方向的偏角
+      const horizontalAngle = Math.atan2(vyHoriz, vxHoriz) * 180 / Math.PI;
+
+      return { vertical: verticalAngle, horizontal: horizontalAngle };
+    }
+
+    // --- 检查关键点是否被遮挡（增强版：检测多个点）---
+    function checkOcclusion(landmarks) {
+      for (let idx of OCCLUSION_POINTS) {
+        if (!landmarks[idx]) return true; // 任一缺失即认为遮挡
+      }
+      return false;
+    }
+
+    // --- 绘制关键点、参考线、中轴线、水平线及所有角度 ---
+    function drawResults(landmarks, width, height, pose, vertAngle, horizAngle, occlusion){
       ctxOverlay.clearRect(0,0,canvasOverlay.width, canvasOverlay.height);
 
+      // 基础参考线（十字和绿色框）
       if (showGuideCheckbox.checked) {
         ctxOverlay.strokeStyle = 'rgba(255,255,255,0.5)';
         ctxOverlay.lineWidth = 1;
@@ -310,38 +402,92 @@
 
       if (!landmarks) return;
 
-      const nose = landmarks[1];
-      const noseX = nose.x * width;
-      const noseY = nose.y * height;
-
+      // 绘制关键点（鼻尖、眼角、嘴巴、下巴、鼻孔等）
+      const nose = landmarks[IDX_NOSE];
+      const noseX = nose.x * width, noseY = nose.y * height;
       ctxOverlay.beginPath();
       ctxOverlay.arc(noseX, noseY, 4, 0, Math.PI*2);
       ctxOverlay.fillStyle = 'rgba(255,0,0,0.9)';
       ctxOverlay.fill();
 
-      const left = landmarks[33], right = landmarks[263];
+      const leftEye = landmarks[IDX_LEFT_EYE_OUTER];
+      const rightEye = landmarks[IDX_RIGHT_EYE_OUTER];
       ctxOverlay.fillStyle = 'rgba(0,150,255,0.9)';
-      ctxOverlay.beginPath(); ctxOverlay.arc(left.x*width, left.y*height, 3,0,Math.PI*2); ctxOverlay.fill();
-      ctxOverlay.beginPath(); ctxOverlay.arc(right.x*width, right.y*height, 3,0,Math.PI*2); ctxOverlay.fill();
+      ctxOverlay.beginPath(); ctxOverlay.arc(leftEye.x*width, leftEye.y*height, 3,0,Math.PI*2); ctxOverlay.fill();
+      ctxOverlay.beginPath(); ctxOverlay.arc(rightEye.x*width, rightEye.y*height, 3,0,Math.PI*2); ctxOverlay.fill();
 
-      if (pose) {
+      // 绘制遮挡检测点（绿色）
+      ctxOverlay.fillStyle = 'rgba(0,255,0,0.8)';
+      for (let idx of OCCLUSION_POINTS) {
+        if (landmarks[idx]) {
+          const pt = landmarks[idx];
+          ctxOverlay.beginPath();
+          ctxOverlay.arc(pt.x * width, pt.y * height, 2, 0, Math.PI*2);
+          ctxOverlay.fill();
+        }
+      }
+
+      // 绘制中轴线（鼻梁到下巴）
+      const noseBridge = landmarks[IDX_NOSE_BRIDGE];
+      const chin = landmarks[IDX_CHIN];
+      if (noseBridge && chin) {
+        const x1 = noseBridge.x * width, y1 = noseBridge.y * height;
+        const x2 = chin.x * width, y2 = chin.y * height;
+        ctxOverlay.beginPath();
+        ctxOverlay.moveTo(x1, y1);
+        ctxOverlay.lineTo(x2, y2);
+        ctxOverlay.strokeStyle = 'rgba(255,0,0,0.6)';
+        ctxOverlay.lineWidth = 2;
+        ctxOverlay.setLineDash([5, 5]);
+        ctxOverlay.stroke();
+        ctxOverlay.setLineDash([]);
+      }
+
+      // 绘制水平线（两眼连线）
+      if (leftEye && rightEye) {
+        const xL = leftEye.x * width, yL = leftEye.y * height;
+        const xR = rightEye.x * width, yR = rightEye.y * height;
+        ctxOverlay.beginPath();
+        ctxOverlay.moveTo(xL, yL);
+        ctxOverlay.lineTo(xR, yR);
+        ctxOverlay.strokeStyle = 'rgba(0,0,255,0.6)';
+        ctxOverlay.lineWidth = 2;
+        ctxOverlay.setLineDash([5, 5]);
+        ctxOverlay.stroke();
+        ctxOverlay.setLineDash([]);
+      }
+
+      // 显示所有角度和偏移
+      if (pose && vertAngle !== null && horizAngle !== null) {
         ctxOverlay.fillStyle = 'rgba(0,0,0,0.6)';
-        ctxOverlay.fillRect(6,6,280,95);
+        ctxOverlay.fillRect(6,6,300,200);
         ctxOverlay.fillStyle = '#fff';
         ctxOverlay.font = '12px monospace';
-        ctxOverlay.fillText(`Yaw ${pose.yaw.toFixed(1)}°`, 12, 24);
-        ctxOverlay.fillText(`Pitch ${pose.pitch.toFixed(1)}°`, 12, 40);
-        ctxOverlay.fillText(`Roll ${pose.roll.toFixed(1)}°`, 12, 56);
+        ctxOverlay.fillText(`Yaw ${pose.yaw.toFixed(1)}°  Pitch ${pose.pitch.toFixed(1)}°  Roll ${pose.roll.toFixed(1)}°`, 12, 24);
+        ctxOverlay.fillText(`中轴倾角 ${vertAngle.toFixed(1)}°  水平倾角 ${horizAngle.toFixed(1)}°`, 12, 42);
 
         const offsetX = ((noseX - width/2) / (width/2)) * 100;
         const offsetY = ((noseY - height/2) / (height/2)) * 100;
-        ctxOverlay.fillText(`偏移 X ${offsetX.toFixed(1)}%  Y ${offsetY.toFixed(1)}%`, 12, 74);
+        ctxOverlay.fillText(`偏移 X ${offsetX.toFixed(1)}%  Y ${offsetY.toFixed(1)}%`, 12, 60);
 
         if (baseline) {
-          ctxOverlay.fillText(`基准 Y ${baseline.yaw.toFixed(1)} P ${baseline.pitch.toFixed(1)} R ${baseline.roll.toFixed(1)}`, 12, 92);
+          ctxOverlay.fillText(`基准 Y ${baseline.yaw.toFixed(1)} P ${baseline.pitch.toFixed(1)} R ${baseline.roll.toFixed(1)}`, 12, 78);
         } else {
-          ctxOverlay.fillText(`基准 未校准`, 12, 92);
+          ctxOverlay.fillText(`基准 未校准`, 12, 78);
         }
+
+        // 显示轴线偏差绝对值
+        const absVert = Math.abs(vertAngle);
+        const absHoriz = Math.abs(horizAngle);
+        ctxOverlay.fillText(`|中轴| ${absVert.toFixed(2)}°  |水平| ${absHoriz.toFixed(2)}°`, 12, 96);
+        ctxOverlay.fillText(`(阈值 2.7°, 立即报警 6s重复)`, 12, 114);
+
+        // 显示距上次轴线提醒时间
+        const now = Date.now();
+        const sinceLastAxis = now - lastAxisAlertTime;
+        ctxOverlay.fillText(`距上次轴线提醒 ${(sinceLastAxis/1000).toFixed(1)}s`, 12, 132);
+        // 显示遮挡状态
+        ctxOverlay.fillText(`遮挡: ${occlusion ? '是' : '否'} (8点检测)`, 12, 150);
       }
     }
 
@@ -359,58 +505,93 @@
       faceMesh.onResults(onResults);
     }
 
-    // --- onResults 回调（核心检测逻辑，使用基准）---
+    // --- onResults 回调（核心检测逻辑）---
     function onResults(results){
       checksCount++;
       const width = canvasOverlay.width;
       const height = canvasOverlay.height;
       let present = false;
       let pose = null;
+      let vertAngle = null, horizAngle = null;
+      let occlusion = false;
 
       if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
         present = true;
         const landmarks = results.multiFaceLandmarks[0];
         pose = estimateHeadPose(landmarks, width, height);
-        lastPose = pose; // 更新 lastPose 供校准使用
-        drawResults(landmarks, width, height, pose);
+        const angles = computeAxisAngles(landmarks, width, height);
+        vertAngle = angles.vertical;
+        horizAngle = angles.horizontal;
+        occlusion = checkOcclusion(landmarks);
+
+        lastPose = pose;
+        drawResults(landmarks, width, height, pose, vertAngle, horizAngle, occlusion);
         lastFaceSeen = Date.now();
       } else {
-        drawResults(null, width, height, null);
+        drawResults(null, width, height, null, null, null, false);
       }
 
       const now = Date.now();
 
+      // 1. 无人脸检测（离开屏幕告警）
       if (!present) {
         const since = lastFaceSeen ? (now - lastFaceSeen) : Infinity;
         if (since > MISSING_FACE_THRESHOLD_MS) {
-          appendLog('无人脸超时，触发警报');
-          triggerAlert('missing_face_threshold');
+          triggerAlert('无人脸超时，请回到屏幕前', 'missing');
           lastFaceSeen = now;
         }
+        // 重置其他状态
+        poseOffStart = null;
+        occlusionActive = false;
       } else {
+        // 2. 遮挡检测
+        if (occlusion) {
+          if (!occlusionActive) {
+            triggerAlert('面部被遮挡（鼻/嘴/下巴等），请调整', 'occlusion');
+            occlusionActive = true;
+          } else {
+            triggerAlert('面部被遮挡（鼻/嘴/下巴等），请调整', 'occlusion');
+          }
+        } else {
+          occlusionActive = false;
+        }
+
+        // 3. 姿态角度检测（基于yaw/pitch/roll，仍使用基准）
+        let poseOutOfBounds = false;
         if (pose) {
-          // 如果有基准，计算差值；否则直接使用原始值
-          let deltaYaw = pose.yaw;
-          let deltaPitch = pose.pitch;
-          let deltaRoll = pose.roll;
+          let deltaYaw = pose.yaw, deltaPitch = pose.pitch, deltaRoll = pose.roll;
           if (baseline) {
             deltaYaw = pose.yaw - baseline.yaw;
             deltaPitch = pose.pitch - baseline.pitch;
             deltaRoll = pose.roll - baseline.roll;
           }
-          const outOfBounds = Math.abs(deltaYaw) > YAW_THRESHOLD_DEG ||
-                              Math.abs(deltaPitch) > PITCH_THRESHOLD_DEG ||
-                              Math.abs(deltaRoll) > ROLL_THRESHOLD_DEG;
-          if (outOfBounds) {
-            if (!offscreenStart) offscreenStart = now;
-            const dur = now - offscreenStart;
-            if (dur > OFFSCREEN_DURATION_MS) {
-              appendLog('姿态异常超时，触发警报');
-              triggerAlert('offscreen_duration');
-              offscreenStart = now;
-            }
-          } else {
-            offscreenStart = null;
+          poseOutOfBounds = Math.abs(deltaYaw) > YAW_THRESHOLD_DEG ||
+                            Math.abs(deltaPitch) > PITCH_THRESHOLD_DEG ||
+                            Math.abs(deltaRoll) > ROLL_THRESHOLD_DEG;
+        }
+
+        // 管理姿态计时器
+        if (poseOutOfBounds) {
+          if (!poseOffStart) poseOffStart = now;
+        } else {
+          poseOffStart = null;
+        }
+
+        if (poseOffStart && (now - poseOffStart) > POSE_OFF_DURATION_MS) {
+          triggerAlert('姿态角度异常（长时间转头/低头）', 'pose');
+          poseOffStart = now;
+        }
+
+        // 4. 轴线角度检测（绝对角度，立即报警）
+        if (vertAngle !== null && horizAngle !== null) {
+          const absVert = Math.abs(vertAngle);
+          const absHoriz = Math.abs(horizAngle);
+          const axisOutOfBounds = absVert > VERTICAL_AXIS_THRESHOLD_DEG || absHoriz > HORIZONTAL_AXIS_THRESHOLD_DEG;
+
+          if (axisOutOfBounds) {
+            // 立即触发，由重复间隔控制
+            const reason = `头部歪斜：中轴${absVert.toFixed(1)}° 水平${absHoriz.toFixed(1)}°`;
+            triggerAlert(reason, 'axis');
           }
         }
       }
@@ -418,11 +599,11 @@
       updateDebug(present, pose ? pose.yaw : null, pose ? pose.pitch : null, pose ? pose.roll : null);
 
       if (perFrameVerboseCheckbox.checked) {
-        console.debug('frame', { checksCount, present, pose, baseline });
+        console.debug('frame', { checksCount, present, pose, baseline, vertAngle, horizAngle, occlusion });
       }
     }
 
-    // --- 校准功能 ---
+    // --- 校准功能（仅用于姿态角度）---
     function calibrate() {
       if (!running) {
         appendLog('校准失败：检测未运行', 'warn');
@@ -506,14 +687,18 @@
 
         running = true;
         lastFaceSeen = Date.now();
-        offscreenStart = null;
+        poseOffStart = null;
         checksCount = 0;
         alertsCount = 0;
-        lastAlertTime = 0;
-        baseline = null; // 重置校准
+        lastPoseAlertTime = 0;
+        lastAxisAlertTime = 0;
+        lastMissingFaceAlertTime = 0;
+        lastOcclusionAlertTime = 0;
+        occlusionActive = false;
+        baseline = null;
         lastPose = null;
-        status.textContent = '检测已启动，请坐端正后点击“校准当前姿态”';
-        appendLog('检测启动，阈值：yaw=' + YAW_THRESHOLD_DEG + '°, pitch=' + PITCH_THRESHOLD_DEG + '°, roll=' + ROLL_THRESHOLD_DEG + '°, 警报冷却=' + (ALERT_COOLDOWN_MS/1000) + '秒');
+        status.textContent = '检测已启动，轴线超过2.7°立即报警，6秒重复';
+        appendLog('检测启动，轴线阈值2.7°（立即报警），姿态角度20/25/15° (0.8s)，离开屏幕1.2s，遮挡立即报警（8点检测），重复提醒间隔6s');
         updateDebug(false, null, null, null);
 
         calibrateBtn.disabled = false;
@@ -564,7 +749,7 @@
     resetCalibBtn.addEventListener('click', resetCalibration);
     testAlertBtn.addEventListener('click', () => {
       appendLog('手动测试警报');
-      triggerAlert('manual_test');
+      triggerAlert('manual_test', 'pose');
     });
     testAudioBtn.addEventListener('click', async () => {
       appendLog('手动测试音频');
@@ -589,7 +774,7 @@
       notification: (("Notification" in window) ? Notification.permission : 'unsupported'),
       streamActive: !!(video.srcObject && video.srcObject.active),
       lastFaceSeen,
-      offscreenStart,
+      poseOffStart,
       alertsCount,
       checksCount,
       docFocus: document.hasFocus(),
@@ -597,7 +782,7 @@
     });
 
     // 初始日志
-    appendLog('页面就绪。新增零位校准功能，请先启动检测后校准。');
+    appendLog('页面就绪。轴线采用绝对角度，超过2.7°立即报警，重复间隔6s，遮挡检测8点。');
     updateDebug(false, null, null, null);
   })();
   </script>
