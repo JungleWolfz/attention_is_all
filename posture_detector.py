@@ -4,7 +4,8 @@ import numpy as np
 import time
 import simpleaudio as sa
 import threading
-from collections import deque
+import tkinter as tk
+from tkinter import font as tkfont
 
 # ================== 配置参数 ==================
 MISSING_FACE_THRESHOLD = 1.2          # 无人脸超过1.2秒触发
@@ -13,10 +14,14 @@ PITCH_THRESHOLD = 25                    # 低头/抬头阈值
 ROLL_THRESHOLD = 15                      # 头部倾斜阈值（用于姿态角度）
 POSE_OFF_DURATION = 0.8                  # 姿态异常持续0.8秒触发
 
-VERTICAL_AXIS_THRESHOLD = 2.7            # 中轴倾角偏差阈值（度）
+VERTICAL_AXIS_THRESHOLD = 3.9            # 中轴倾角偏差阈值（度）
 HORIZONTAL_AXIS_THRESHOLD = 2.7          # 水平线倾角偏差阈值
 
-REPEAT_ALERT_INTERVAL = 6.0               # 重复提醒间隔（秒）
+REPEAT_ALERT_INTERVAL = 6.0               # 坐姿不良重复提醒间隔（秒）
+
+# 久坐提醒参数
+SIT_DURATION = 2700                       # 久坐时间（秒），默认45分钟
+BREAK_DURATION = 300                       # 休息时间（秒），默认5分钟
 
 # 关键点索引（MediaPipe Face Mesh）
 IDX_NOSE = 1
@@ -41,11 +46,9 @@ mp_drawing = mp.solutions.drawing_utils
 def beep():
     """播放一个短促的蜂鸣声（约140ms）"""
     try:
-        # 生成一个正弦波（频率880Hz，时长0.14秒）
         sample_rate = 44100
         t = np.linspace(0, 0.14, int(sample_rate * 0.14))
         wave = (0.1 * np.sin(880 * 2 * np.pi * t)).astype(np.float32)
-        # 转换为16位整数
         wave = (wave * 32767).astype(np.int16)
         play_obj = sa.play_buffer(wave, 1, 2, sample_rate)
         play_obj.wait_done()
@@ -68,11 +71,54 @@ class State:
         self.occlusion_active = False       # 当前是否遮挡中
         self.any_alert_active = False       # 是否有任意警报正在持续
 
+        # 久坐相关
+        self.sit_start_time = None          # 本次坐下的开始时间（有人脸且无遮挡？通常只要有人脸就算坐下）
+        self.break_active = False           # 是否正在显示弹窗
+        self.last_break_alert_time = 0      # 上次弹窗的时间，用于冷却
+
 state = State()
+
+# ================== 弹窗显示（独立线程） ==================
+def show_break_window(duration):
+    """显示全屏半透明倒计时窗口，持续duration秒后自动关闭"""
+    def run_tk():
+        root = tk.Tk()
+        root.title("久坐提醒")
+        root.attributes('-fullscreen', True)
+        root.attributes('-alpha', 0.8)       # 半透明
+        root.attributes('-topmost', True)    # 置顶
+        root.configure(bg='black')
+        root.overrideredirect(True)           # 无边框
+
+        # 使用大字体
+        large_font = tkfont.Font(size=48, weight='bold')
+        label_msg = tk.Label(root, text="久坐提醒！请起身活动", fg='red', bg='black', font=large_font)
+        label_msg.pack(expand=True)
+
+        time_var = tk.StringVar()
+        time_var.set(f"{duration//60}:{duration%60:02d} 分钟后自动关闭")
+        label_time = tk.Label(root, textvariable=time_var, fg='yellow', bg='black', font=('Arial', 36))
+        label_time.pack(expand=True)
+
+        # 倒计时更新函数
+        def countdown(remaining):
+            if remaining <= 0:
+                root.destroy()
+                state.break_active = False
+                return
+            mins, secs = divmod(remaining, 60)
+            time_var.set(f"{mins}:{secs:02d} 分钟后自动关闭")
+            root.after(1000, countdown, remaining - 1)
+
+        root.after(1000, countdown, duration - 1)  # 立即开始倒计时（减1秒因为已经过1秒）
+        root.mainloop()
+
+    if not state.break_active:
+        state.break_active = True
+        threading.Thread(target=run_tk, daemon=True).start()
 
 # ================== 姿态估计 ==================
 def estimate_head_pose(landmarks, img_w, img_h):
-    """三点法估计 yaw/pitch/roll（相对于基准，这里只返回原始值）"""
     nose = landmarks[IDX_NOSE]
     left_eye = landmarks[IDX_LEFT_EYE_OUTER]
     right_eye = landmarks[IDX_RIGHT_EYE_OUTER]
@@ -84,7 +130,6 @@ def estimate_head_pose(landmarks, img_w, img_h):
     xR = right_eye.x * img_w
     yR = right_eye.y * img_h
 
-    # 两眼连线
     vx = xR - xL
     vy = yR - yL
     inter_eye = np.hypot(vx, vy) + 1e-6
@@ -103,18 +148,15 @@ def estimate_head_pose(landmarks, img_w, img_h):
 
 # ================== 中轴/水平线夹角 ==================
 def compute_axis_angles(landmarks, img_w, img_h):
-    """计算中轴线与垂直方向的夹角、水平线与水平方向的夹角"""
     nb = landmarks[IDX_NOSE_BRIDGE]
     chin = landmarks[IDX_CHIN]
     left_eye = landmarks[IDX_LEFT_EYE_OUTER]
     right_eye = landmarks[IDX_RIGHT_EYE_OUTER]
 
-    # 中轴线向量
     vx_vert = (chin.x - nb.x) * img_w
     vy_vert = (chin.y - nb.y) * img_h
-    vertical_angle = np.arctan2(vx_vert, vy_vert) * 180 / np.pi   # 向右为正
+    vertical_angle = np.arctan2(vx_vert, vy_vert) * 180 / np.pi
 
-    # 水平线向量
     vx_horiz = (right_eye.x - left_eye.x) * img_w
     vy_horiz = (right_eye.y - left_eye.y) * img_h
     horizontal_angle = np.arctan2(vy_horiz, vx_horiz) * 180 / np.pi
@@ -123,29 +165,21 @@ def compute_axis_angles(landmarks, img_w, img_h):
 
 # ================== 遮挡检测 ==================
 def check_occlusion(landmarks):
-    """检查关键点是否全部存在"""
     for idx in OCCLUSION_POINTS:
         if not landmarks[idx]:
             return True
     return False
 
-# ================== 警报触发（带重复间隔） ==================
+# ================== 坐姿不良警报触发（带重复间隔） ==================
 def trigger_alert(reason, alert_type, current_time):
     last = state.last_alert_times[alert_type]
     if current_time - last >= REPEAT_ALERT_INTERVAL:
         state.last_alert_times[alert_type] = current_time
-        print(f"[{time.strftime('%H:%M:%S')}] 警报: {reason}")
-        # 在独立线程中播放蜂鸣，避免阻塞主循环
+        print(f"[{time.strftime('%H:%M:%S')}] ALERT: {reason}")
         threading.Thread(target=beep, daemon=True).start()
         state.any_alert_active = True
     else:
-        # 虽未达到间隔，但只要有异常，仍标记为活跃
         state.any_alert_active = True
-
-def clear_alert_if_needed(current_time):
-    """如果所有异常都已消失，重置 any_alert_active"""
-    # 该函数在每帧结束后调用，如果检测到没有异常，则清除
-    pass  # 实际在每帧最后判断
 
 # ================== 主循环 ==================
 def main():
@@ -157,9 +191,8 @@ def main():
         print("无法打开摄像头")
         return
 
-    print("坐姿检测已启动。按 'q' 退出，按 'c' 校准当前姿态。")
+    print("Posture detection started. Press 'q' to quit, 'c' to calibrate baseline.")
 
-    # 用于计算帧率（可选）
     prev_time = time.time()
 
     while True:
@@ -172,7 +205,6 @@ def main():
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = face_mesh.process(rgb_frame)
 
-        # 初始化标志
         present = False
         pose = None
         vert_angle = None
@@ -190,12 +222,12 @@ def main():
             state.last_face_seen = current_time
             state.last_pose = pose
 
-            # ========== 检测逻辑 ==========
+            # 坐姿检测逻辑（保持不变）
             # 1. 遮挡检测
             if occlusion:
                 if not state.occlusion_active:
                     state.occlusion_active = True
-                trigger_alert("面部被遮挡（鼻/嘴/下巴等）", 'occlusion', current_time)
+                trigger_alert("Face occluded (nose/mouth/chin)", 'occlusion', current_time)
                 any_alert = True
             else:
                 state.occlusion_active = False
@@ -213,7 +245,7 @@ def main():
                 if not state.pose_off_start:
                     state.pose_off_start = current_time
                 if current_time - state.pose_off_start >= POSE_OFF_DURATION:
-                    trigger_alert("姿态角度异常（长时间转头/低头）", 'pose', current_time)
+                    trigger_alert("Pose angle deviation (head turned/tilted)", 'pose', current_time)
                     any_alert = True
             else:
                 state.pose_off_start = None
@@ -223,7 +255,7 @@ def main():
                 abs_vert = abs(vert_angle)
                 abs_horiz = abs(horiz_angle)
                 if abs_vert > VERTICAL_AXIS_THRESHOLD or abs_horiz > HORIZONTAL_AXIS_THRESHOLD:
-                    reason = f"头部歪斜：中轴{abs_vert:.1f}° 水平{abs_horiz:.1f}°"
+                    reason = f"Head tilt: Vert {abs_vert:.1f}°  Horiz {abs_horiz:.1f}°"
                     trigger_alert(reason, 'axis', current_time)
                     any_alert = True
 
@@ -232,17 +264,33 @@ def main():
             if state.last_face_seen is not None:
                 since = current_time - state.last_face_seen
                 if since > MISSING_FACE_THRESHOLD:
-                    trigger_alert("无人脸超时，请回到屏幕前", 'missing', current_time)
+                    trigger_alert("No face detected", 'missing', current_time)
                     any_alert = True
-            # 重置其他状态
             state.pose_off_start = None
             state.occlusion_active = False
 
-        # 更新全局活跃标志
         state.any_alert_active = any_alert
 
-        # ========== 绘制信息 ==========
-        # 绘制参考线
+        # ========== 久坐计时和提醒 ==========
+        # 定义“坐着”的条件：有人脸且没有被遮挡（可选，可根据需要调整）
+        if present and not occlusion:
+            if state.sit_start_time is None:
+                state.sit_start_time = current_time
+            else:
+                sit_duration = current_time - state.sit_start_time
+                # 如果达到久坐时间，并且没有正在显示的弹窗，并且距离上次弹窗已经超过休息时长（避免连续弹）
+                if sit_duration >= SIT_DURATION and not state.break_active:
+                    if current_time - state.last_break_alert_time >= BREAK_DURATION:
+                        print(f"Sit duration reached {sit_duration:.0f}s, showing break window")
+                        show_break_window(BREAK_DURATION)
+                        state.last_break_alert_time = current_time
+                        # 重置计时器，开始新的久坐周期（从0开始）
+                        state.sit_start_time = current_time
+        else:
+            # 如果人离开或被遮挡，重置久坐计时器
+            state.sit_start_time = None
+
+        # ========== 绘制信息（全部英文） ==========
         cv2.line(frame, (img_w//2, 0), (img_w//2, img_h), (255, 255, 255), 1)
         cv2.line(frame, (0, img_h//2), (img_w, img_h//2), (255, 255, 255), 1)
         cv2.rectangle(frame, (int(img_w*0.3), int(img_h*0.2)),
@@ -250,19 +298,16 @@ def main():
 
         if results.multi_face_landmarks:
             landmarks = results.multi_face_landmarks[0].landmark
-            # 绘制关键点
             for idx in OCCLUSION_POINTS:
                 if landmarks[idx]:
                     x = int(landmarks[idx].x * img_w)
                     y = int(landmarks[idx].y * img_h)
                     cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
 
-            # 绘制鼻尖（红色）
             x_nose = int(landmarks[IDX_NOSE].x * img_w)
             y_nose = int(landmarks[IDX_NOSE].y * img_h)
             cv2.circle(frame, (x_nose, y_nose), 4, (0, 0, 255), -1)
 
-            # 绘制眼角（蓝色）
             x_left = int(landmarks[IDX_LEFT_EYE_OUTER].x * img_w)
             y_left = int(landmarks[IDX_LEFT_EYE_OUTER].y * img_h)
             x_right = int(landmarks[IDX_RIGHT_EYE_OUTER].x * img_w)
@@ -270,64 +315,63 @@ def main():
             cv2.circle(frame, (x_left, y_left), 3, (255, 0, 0), -1)
             cv2.circle(frame, (x_right, y_right), 3, (255, 0, 0), -1)
 
-            # 绘制中轴线（鼻梁到下巴）
             x_nb = int(landmarks[IDX_NOSE_BRIDGE].x * img_w)
             y_nb = int(landmarks[IDX_NOSE_BRIDGE].y * img_h)
             x_chin = int(landmarks[IDX_CHIN].x * img_w)
             y_chin = int(landmarks[IDX_CHIN].y * img_h)
             cv2.line(frame, (x_nb, y_nb), (x_chin, y_chin), (0, 0, 255), 2, cv2.LINE_AA)
-
-            # 绘制水平线（两眼连线）
             cv2.line(frame, (x_left, y_left), (x_right, y_right), (255, 0, 0), 2, cv2.LINE_AA)
 
-            # 显示角度信息
             if pose:
                 cv2.putText(frame, f"Yaw: {pose['yaw']:.1f}  Pitch: {pose['pitch']:.1f}  Roll: {pose['roll']:.1f}",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             if vert_angle is not None:
-                cv2.putText(frame, f"中轴: {vert_angle:.1f}° 水平: {horiz_angle:.1f}°",
+                cv2.putText(frame, f"Vert: {vert_angle:.1f}°  Horiz: {horiz_angle:.1f}°",
                             (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                cv2.putText(frame, f"偏差: |中轴| {abs(vert_angle):.2f}°  |水平| {abs(horiz_angle):.2f}°",
+                cv2.putText(frame, f"|Vert|: {abs(vert_angle):.2f}°  |Horiz|: {abs(horiz_angle):.2f}°",
                             (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            if occlusion:
-                cv2.putText(frame, "遮挡: 是", (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            else:
-                cv2.putText(frame, "遮挡: 否", (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            occ_text = "Occlusion: Yes" if occlusion else "Occlusion: No"
+            color = (0, 0, 255) if occlusion else (0, 255, 0)
+            cv2.putText(frame, occ_text, (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # 显示基准状态
             if state.baseline:
-                cv2.putText(frame, f"基准: Y {state.baseline['yaw']:.1f} P {state.baseline['pitch']:.1f} R {state.baseline['roll']:.1f}",
+                cv2.putText(frame, f"Baseline: Y {state.baseline['yaw']:.1f} P {state.baseline['pitch']:.1f} R {state.baseline['roll']:.1f}",
                             (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             else:
-                cv2.putText(frame, "基准: 未校准", (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 2)
+                cv2.putText(frame, "Baseline: not set", (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 2)
 
-            # 显示计时器
-            cv2.putText(frame, f"距上次轴线提醒: {current_time - state.last_alert_times['axis']:.1f}s",
+            time_since_axis = current_time - state.last_alert_times['axis']
+            cv2.putText(frame, f"Last axis alert: {time_since_axis:.1f}s ago",
                         (10, 155), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-        else:
-            cv2.putText(frame, "无人脸", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            # 显示久坐计时
+            if state.sit_start_time is not None:
+                sit_elapsed = current_time - state.sit_start_time
+                cv2.putText(frame, f"Sit time: {int(sit_elapsed//60)}:{int(sit_elapsed%60):02d} / {SIT_DURATION//60}min",
+                            (img_w-250, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            else:
+                cv2.putText(frame, "Sit time: paused", (img_w-250, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
 
-        # 显示帧率和状态
+        else:
+            cv2.putText(frame, "No face", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
         fps = 1.0 / (time.time() - prev_time + 1e-6)
         prev_time = time.time()
         cv2.putText(frame, f"FPS: {fps:.1f}", (img_w-100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        cv2.putText(frame, f"警报计数: {sum(state.last_alert_times[t] > 0 for t in state.last_alert_times)}",
-                    (img_w-150, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        alert_count = sum(1 for t in state.last_alert_times if state.last_alert_times[t] > 0)
+        cv2.putText(frame, f"Alerts: {alert_count}", (img_w-100, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-        cv2.imshow('坐姿检测 - 后台持续运行', frame)
+        cv2.imshow('Posture Detection (runs in background)', frame)
 
-        # 按键处理
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
         elif key == ord('c'):
-            # 校准当前姿态
             if state.last_pose:
                 state.baseline = state.last_pose.copy()
-                print(f"校准完成: 基准 yaw={state.baseline['yaw']:.1f} pitch={state.baseline['pitch']:.1f} roll={state.baseline['roll']:.1f}")
+                print(f"Calibrated: yaw={state.baseline['yaw']:.1f} pitch={state.baseline['pitch']:.1f} roll={state.baseline['roll']:.1f}")
             else:
-                print("校准失败：未检测到有效姿态")
+                print("Calibration failed: no pose data")
 
     cap.release()
     cv2.destroyAllWindows()
