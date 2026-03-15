@@ -9,17 +9,16 @@ import tkinter as tk
 from tkinter import font as tkfont
 
 # ================== 配置参数 ==================
-MISSING_FACE_THRESHOLD = 1.2          # 无人脸超过1.2秒触发
-YAW_THRESHOLD = 20                     # 左右转头阈值（度，相对于基准）
+MISSING_FACE_THRESHOLD = 5.0           # 无人脸超过5秒触发离开警报（短暂低头/转头不会触发）
+SIT_LOST_TIMEOUT = 30                  # 人脸丢失后仍视为坐着的最大缓冲时间（秒），超过则重置久坐计时
+YAW_THRESHOLD = 20                      # 左右转头阈值（度，相对于基准）
 PITCH_THRESHOLD = 25                    # 低头/抬头阈值
 ROLL_THRESHOLD = 15                      # 头部倾斜阈值（用于姿态角度）
 POSE_OFF_DURATION = 0.8                  # 姿态异常持续0.8秒触发
 
 VERTICAL_AXIS_THRESHOLD = 3.9            # 中轴倾角偏差阈值（度）
 HORIZONTAL_AXIS_THRESHOLD = 3.6          # 水平线倾角偏差阈值
-
-# 新增：眼睛中心垂直偏移阈值（归一化坐标，0~1）
-VERTICAL_OFFSET_THRESHOLD = 0.096          # 两眼中心偏离画面中心超过15%时触发
+VERTICAL_OFFSET_THRESHOLD = 0.96          # 眼睛中心偏离画面中心超过15%时触发
 
 REPEAT_ALERT_INTERVAL = 6.0               # 坐姿不良重复提醒间隔（秒）
 
@@ -44,7 +43,6 @@ face_mesh = mp_face_mesh.FaceMesh(
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
 )
-mp_drawing = mp.solutions.drawing_utils
 
 # ================== 音频蜂鸣 ==================
 def beep():
@@ -71,7 +69,7 @@ class BreakWindowManager:
 
     def _run(self):
         root = tk.Tk()
-        root.withdraw()  # 隐藏主窗口
+        root.withdraw()
         self.root = root
 
         def process_queue():
@@ -86,14 +84,14 @@ class BreakWindowManager:
                             self.window = None
             except queue.Empty:
                 pass
-            root.after(100, process_queue)  # 每100ms检查一次队列
+            root.after(100, process_queue)
 
         root.after(100, process_queue)
         root.mainloop()
 
     def _show_window(self, duration):
         if self.window:
-            return  # 已存在窗口，不重复创建
+            return
         window = tk.Toplevel(self.root)
         window.title("久坐提醒")
         window.attributes('-fullscreen', True)
@@ -126,11 +124,9 @@ class BreakWindowManager:
         window.after(1000, countdown, duration - 1)
 
     def show(self, duration):
-        """向Tkinter线程发送显示弹窗的命令"""
         self.q.put(('show', {'duration': duration}))
 
     def close(self):
-        """关闭当前弹窗（如有）"""
         self.q.put(('close', {}))
 
 # ================== 全局状态 ==================
@@ -145,14 +141,15 @@ class State:
             'pose': 0,
             'vertical_offset': 0
         }
-        self.baseline = None               # 姿态基准 {yaw, pitch, roll}
-        self.last_pose = None               # 最近一次姿态
-        self.occlusion_active = False       # 当前是否遮挡中
-        self.any_alert_active = False       # 是否有任意警报正在持续
+        self.baseline = None
+        self.last_pose = None
+        self.occlusion_active = False
+        self.any_alert_active = False
 
-        # 久坐相关
-        self.sit_start_time = None          # 本次坐下的开始时间
-        self.last_break_alert_time = 0      # 上次弹窗的时间，用于冷却
+        # 久坐相关（带缓冲）
+        self.sit_accumulated = 0.0        # 累计坐姿时间（秒）
+        self.sit_lost_start = None         # 人脸丢失开始时间
+        self.last_break_alert_time = 0
 
 state = State()
 
@@ -230,10 +227,10 @@ def main():
         print("无法打开摄像头")
         return
 
-    # 初始化弹窗管理器
     break_manager = BreakWindowManager()
 
     print("Posture detection started. Press 'q' to quit, 'c' to calibrate baseline.")
+    print(f"无人脸警报延迟: {MISSING_FACE_THRESHOLD}s, 久坐缓冲: {SIT_LOST_TIMEOUT}s")
 
     prev_time = time.time()
 
@@ -262,11 +259,10 @@ def main():
             vert_angle, horiz_angle = compute_axis_angles(landmarks, img_w, img_h)
             occlusion = check_occlusion(landmarks)
 
-            # 计算两眼中心垂直偏移（归一化坐标，0~1）
             left_eye = landmarks[IDX_LEFT_EYE_OUTER]
             right_eye = landmarks[IDX_RIGHT_EYE_OUTER]
             eye_center_y = (left_eye.y + right_eye.y) / 2.0
-            vertical_offset = abs(eye_center_y - 0.5)  # 0.5 是画面中心y
+            vertical_offset = abs(eye_center_y - 0.5)
 
             state.last_face_seen = current_time
             state.last_pose = pose
@@ -318,27 +314,41 @@ def main():
             if state.last_face_seen is not None:
                 since = current_time - state.last_face_seen
                 if since > MISSING_FACE_THRESHOLD:
-                    trigger_alert("No face detected", 'missing', current_time)
+                    trigger_alert("No face detected (possible leave)", 'missing', current_time)
                     any_alert = True
             state.pose_off_start = None
             state.occlusion_active = False
 
         state.any_alert_active = any_alert
 
-        # ========== 久坐计时和提醒 ==========
+        # ========== 久坐计时（带缓冲） ==========
         if present and not occlusion:
-            if state.sit_start_time is None:
-                state.sit_start_time = current_time
-            else:
-                sit_duration = current_time - state.sit_start_time
-                if sit_duration >= SIT_DURATION:
-                    if current_time - state.last_break_alert_time >= BREAK_DURATION:
-                        print(f"Sit duration reached {sit_duration:.0f}s, showing break window")
-                        break_manager.show(BREAK_DURATION)
-                        state.last_break_alert_time = current_time
-                        state.sit_start_time = current_time  # 重置计时器
+            # 有人脸且未被遮挡 -> 认为正在坐着
+            if state.sit_lost_start is not None:
+                # 之前丢失，现在恢复，累计时间保持不变（继续累计）
+                state.sit_lost_start = None
+            # 累计坐姿时间
+            delta = current_time - prev_time
+            state.sit_accumulated += delta
         else:
-            state.sit_start_time = None
+            # 无人脸或遮挡 -> 开始丢失计时
+            if state.sit_lost_start is None:
+                state.sit_lost_start = current_time
+            else:
+                lost_duration = current_time - state.sit_lost_start
+                if lost_duration > SIT_LOST_TIMEOUT:
+                    # 丢失超过缓冲，重置累计时间
+                    state.sit_accumulated = 0.0
+                    state.sit_lost_start = None  # 等待下次有人再重新计时
+
+        # 久坐提醒触发
+        if state.sit_accumulated >= SIT_DURATION:
+            if current_time - state.last_break_alert_time >= BREAK_DURATION:
+                print(f"Sit accumulated reached {state.sit_accumulated:.0f}s, showing break window")
+                break_manager.show(BREAK_DURATION)
+                state.last_break_alert_time = current_time
+                # 重置累计时间，开始新的周期
+                state.sit_accumulated = 0.0
 
         # ========== 绘制信息 ==========
         cv2.line(frame, (img_w//2, 0), (img_w//2, img_h), (255, 255, 255), 1)
@@ -381,7 +391,6 @@ def main():
                 cv2.putText(frame, f"|Vert|: {abs(vert_angle):.2f}°  |Horiz|: {abs(horiz_angle):.2f}°",
                             (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-            # 显示眼睛垂直偏移
             cv2.putText(frame, f"Eye offset: {vertical_offset:.3f} (thresh {VERTICAL_OFFSET_THRESHOLD})",
                         (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
@@ -395,22 +404,30 @@ def main():
             else:
                 cv2.putText(frame, "Baseline: not set", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 2)
 
-            # 显示各个警报距上次触发时间
+            # 警报时间
             time_since_axis = current_time - state.last_alert_times['axis']
             time_since_vertical = current_time - state.last_alert_times['vertical_offset']
             cv2.putText(frame, f"Last axis: {time_since_axis:.1f}s  Last vert: {time_since_vertical:.1f}s",
                         (10, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-            # 显示久坐计时
-            if state.sit_start_time is not None:
-                sit_elapsed = current_time - state.sit_start_time
-                cv2.putText(frame, f"Sit time: {int(sit_elapsed//60)}:{int(sit_elapsed%60):02d} / {SIT_DURATION//60}min",
-                            (img_w-250, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            else:
-                cv2.putText(frame, "Sit time: paused", (img_w-250, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+            # 无人脸倒计时
+            if not present:
+                if state.last_face_seen is not None:
+                    elapsed = current_time - state.last_face_seen
+                    remain = max(0, MISSING_FACE_THRESHOLD - elapsed)
+                    cv2.putText(frame, f"No face in {remain:.1f}s -> alert",
+                                (img_w-300, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
         else:
             cv2.putText(frame, "No face", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+        # 显示久坐计时和缓冲状态
+        if state.sit_lost_start is not None:
+            lost_remain = max(0, SIT_LOST_TIMEOUT - (current_time - state.sit_lost_start))
+            status = f"Sit: {int(state.sit_accumulated//60)}:{int(state.sit_accumulated%60):02d} (lost pause, {lost_remain:.0f}s to reset)"
+        else:
+            status = f"Sit: {int(state.sit_accumulated//60)}:{int(state.sit_accumulated%60):02d} / {SIT_DURATION//60}min"
+        cv2.putText(frame, status, (img_w-300, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         fps = 1.0 / (time.time() - prev_time + 1e-6)
         prev_time = time.time()
@@ -432,7 +449,6 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
-    # 关闭弹窗线程（可选）
     break_manager.close()
 
 if __name__ == "__main__":
