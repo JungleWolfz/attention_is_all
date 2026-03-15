@@ -4,6 +4,7 @@ import numpy as np
 import time
 import simpleaudio as sa
 import threading
+import queue
 import tkinter as tk
 from tkinter import font as tkfont
 
@@ -15,7 +16,10 @@ ROLL_THRESHOLD = 15                      # 头部倾斜阈值（用于姿态角�
 POSE_OFF_DURATION = 0.8                  # 姿态异常持续0.8秒触发
 
 VERTICAL_AXIS_THRESHOLD = 3.9            # 中轴倾角偏差阈值（度）
-HORIZONTAL_AXIS_THRESHOLD = 2.7          # 水平线倾角偏差阈值
+HORIZONTAL_AXIS_THRESHOLD = 3.6          # 水平线倾角偏差阈值
+
+# 新增：眼睛中心垂直偏移阈值（归一化坐标，0~1）
+VERTICAL_OFFSET_THRESHOLD = 0.096          # 两眼中心偏离画面中心超过15%时触发
 
 REPEAT_ALERT_INTERVAL = 6.0               # 坐姿不良重复提醒间隔（秒）
 
@@ -55,6 +59,80 @@ def beep():
     except Exception as e:
         print(f"音频播放失败: {e}")
 
+# ================== 弹窗管理器（独立Tkinter线程） ==================
+class BreakWindowManager:
+    def __init__(self):
+        self.q = queue.Queue()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        self.root = None
+        self.window = None
+        self.time_var = None
+
+    def _run(self):
+        root = tk.Tk()
+        root.withdraw()  # 隐藏主窗口
+        self.root = root
+
+        def process_queue():
+            try:
+                while True:
+                    cmd, args = self.q.get_nowait()
+                    if cmd == 'show':
+                        self._show_window(args['duration'])
+                    elif cmd == 'close':
+                        if self.window:
+                            self.window.destroy()
+                            self.window = None
+            except queue.Empty:
+                pass
+            root.after(100, process_queue)  # 每100ms检查一次队列
+
+        root.after(100, process_queue)
+        root.mainloop()
+
+    def _show_window(self, duration):
+        if self.window:
+            return  # 已存在窗口，不重复创建
+        window = tk.Toplevel(self.root)
+        window.title("久坐提醒")
+        window.attributes('-fullscreen', True)
+        window.attributes('-alpha', 0.8)
+        window.attributes('-topmost', True)
+        window.configure(bg='black')
+        window.overrideredirect(True)
+
+        large_font = tkfont.Font(size=48, weight='bold')
+        label_msg = tk.Label(window, text="久坐提醒！请起身活动", fg='red', bg='black', font=large_font)
+        label_msg.pack(expand=True)
+
+        time_var = tk.StringVar()
+        time_var.set(f"{duration//60}:{duration%60:02d} 分钟后自动关闭")
+        label_time = tk.Label(window, textvariable=time_var, fg='yellow', bg='black', font=('Arial', 36))
+        label_time.pack(expand=True)
+
+        self.window = window
+        self.time_var = time_var
+
+        def countdown(remaining):
+            if remaining <= 0:
+                window.destroy()
+                self.window = None
+                return
+            mins, secs = divmod(remaining, 60)
+            time_var.set(f"{mins}:{secs:02d} 分钟后自动关闭")
+            window.after(1000, countdown, remaining - 1)
+
+        window.after(1000, countdown, duration - 1)
+
+    def show(self, duration):
+        """向Tkinter线程发送显示弹窗的命令"""
+        self.q.put(('show', {'duration': duration}))
+
+    def close(self):
+        """关闭当前弹窗（如有）"""
+        self.q.put(('close', {}))
+
 # ================== 全局状态 ==================
 class State:
     def __init__(self):
@@ -64,7 +142,8 @@ class State:
             'axis': 0,
             'occlusion': 0,
             'missing': 0,
-            'pose': 0
+            'pose': 0,
+            'vertical_offset': 0
         }
         self.baseline = None               # 姿态基准 {yaw, pitch, roll}
         self.last_pose = None               # 最近一次姿态
@@ -72,50 +151,10 @@ class State:
         self.any_alert_active = False       # 是否有任意警报正在持续
 
         # 久坐相关
-        self.sit_start_time = None          # 本次坐下的开始时间（有人脸且无遮挡？通常只要有人脸就算坐下）
-        self.break_active = False           # 是否正在显示弹窗
+        self.sit_start_time = None          # 本次坐下的开始时间
         self.last_break_alert_time = 0      # 上次弹窗的时间，用于冷却
 
 state = State()
-
-# ================== 弹窗显示（独立线程） ==================
-def show_break_window(duration):
-    """显示全屏半透明倒计时窗口，持续duration秒后自动关闭"""
-    def run_tk():
-        root = tk.Tk()
-        root.title("久坐提醒")
-        root.attributes('-fullscreen', True)
-        root.attributes('-alpha', 0.8)       # 半透明
-        root.attributes('-topmost', True)    # 置顶
-        root.configure(bg='black')
-        root.overrideredirect(True)           # 无边框
-
-        # 使用大字体
-        large_font = tkfont.Font(size=48, weight='bold')
-        label_msg = tk.Label(root, text="久坐提醒！请起身活动", fg='red', bg='black', font=large_font)
-        label_msg.pack(expand=True)
-
-        time_var = tk.StringVar()
-        time_var.set(f"{duration//60}:{duration%60:02d} 分钟后自动关闭")
-        label_time = tk.Label(root, textvariable=time_var, fg='yellow', bg='black', font=('Arial', 36))
-        label_time.pack(expand=True)
-
-        # 倒计时更新函数
-        def countdown(remaining):
-            if remaining <= 0:
-                root.destroy()
-                state.break_active = False
-                return
-            mins, secs = divmod(remaining, 60)
-            time_var.set(f"{mins}:{secs:02d} 分钟后自动关闭")
-            root.after(1000, countdown, remaining - 1)
-
-        root.after(1000, countdown, duration - 1)  # 立即开始倒计时（减1秒因为已经过1秒）
-        root.mainloop()
-
-    if not state.break_active:
-        state.break_active = True
-        threading.Thread(target=run_tk, daemon=True).start()
 
 # ================== 姿态估计 ==================
 def estimate_head_pose(landmarks, img_w, img_h):
@@ -170,7 +209,7 @@ def check_occlusion(landmarks):
             return True
     return False
 
-# ================== 坐姿不良警报触发（带重复间隔） ==================
+# ================== 坐姿不良警报触发 ==================
 def trigger_alert(reason, alert_type, current_time):
     last = state.last_alert_times[alert_type]
     if current_time - last >= REPEAT_ALERT_INTERVAL:
@@ -191,6 +230,9 @@ def main():
         print("无法打开摄像头")
         return
 
+    # 初始化弹窗管理器
+    break_manager = BreakWindowManager()
+
     print("Posture detection started. Press 'q' to quit, 'c' to calibrate baseline.")
 
     prev_time = time.time()
@@ -210,6 +252,7 @@ def main():
         vert_angle = None
         horiz_angle = None
         occlusion = False
+        vertical_offset = 0.0
         any_alert = False
 
         if results.multi_face_landmarks:
@@ -219,10 +262,15 @@ def main():
             vert_angle, horiz_angle = compute_axis_angles(landmarks, img_w, img_h)
             occlusion = check_occlusion(landmarks)
 
+            # 计算两眼中心垂直偏移（归一化坐标，0~1）
+            left_eye = landmarks[IDX_LEFT_EYE_OUTER]
+            right_eye = landmarks[IDX_RIGHT_EYE_OUTER]
+            eye_center_y = (left_eye.y + right_eye.y) / 2.0
+            vertical_offset = abs(eye_center_y - 0.5)  # 0.5 是画面中心y
+
             state.last_face_seen = current_time
             state.last_pose = pose
 
-            # 坐姿检测逻辑（保持不变）
             # 1. 遮挡检测
             if occlusion:
                 if not state.occlusion_active:
@@ -259,6 +307,12 @@ def main():
                     trigger_alert(reason, 'axis', current_time)
                     any_alert = True
 
+            # 4. 眼睛中心垂直偏移检测
+            if vertical_offset > VERTICAL_OFFSET_THRESHOLD:
+                reason = f"Eye level offset: {vertical_offset:.2f} (> {VERTICAL_OFFSET_THRESHOLD:.2f})"
+                trigger_alert(reason, 'vertical_offset', current_time)
+                any_alert = True
+
         else:
             # 无人脸检测
             if state.last_face_seen is not None:
@@ -272,25 +326,21 @@ def main():
         state.any_alert_active = any_alert
 
         # ========== 久坐计时和提醒 ==========
-        # 定义“坐着”的条件：有人脸且没有被遮挡（可选，可根据需要调整）
         if present and not occlusion:
             if state.sit_start_time is None:
                 state.sit_start_time = current_time
             else:
                 sit_duration = current_time - state.sit_start_time
-                # 如果达到久坐时间，并且没有正在显示的弹窗，并且距离上次弹窗已经超过休息时长（避免连续弹）
-                if sit_duration >= SIT_DURATION and not state.break_active:
+                if sit_duration >= SIT_DURATION:
                     if current_time - state.last_break_alert_time >= BREAK_DURATION:
                         print(f"Sit duration reached {sit_duration:.0f}s, showing break window")
-                        show_break_window(BREAK_DURATION)
+                        break_manager.show(BREAK_DURATION)
                         state.last_break_alert_time = current_time
-                        # 重置计时器，开始新的久坐周期（从0开始）
-                        state.sit_start_time = current_time
+                        state.sit_start_time = current_time  # 重置计时器
         else:
-            # 如果人离开或被遮挡，重置久坐计时器
             state.sit_start_time = None
 
-        # ========== 绘制信息（全部英文） ==========
+        # ========== 绘制信息 ==========
         cv2.line(frame, (img_w//2, 0), (img_w//2, img_h), (255, 255, 255), 1)
         cv2.line(frame, (0, img_h//2), (img_w, img_h//2), (255, 255, 255), 1)
         cv2.rectangle(frame, (int(img_w*0.3), int(img_h*0.2)),
@@ -330,19 +380,26 @@ def main():
                             (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 cv2.putText(frame, f"|Vert|: {abs(vert_angle):.2f}°  |Horiz|: {abs(horiz_angle):.2f}°",
                             (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            # 显示眼睛垂直偏移
+            cv2.putText(frame, f"Eye offset: {vertical_offset:.3f} (thresh {VERTICAL_OFFSET_THRESHOLD})",
+                        (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
             occ_text = "Occlusion: Yes" if occlusion else "Occlusion: No"
             color = (0, 0, 255) if occlusion else (0, 255, 0)
-            cv2.putText(frame, occ_text, (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.putText(frame, occ_text, (10, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
             if state.baseline:
                 cv2.putText(frame, f"Baseline: Y {state.baseline['yaw']:.1f} P {state.baseline['pitch']:.1f} R {state.baseline['roll']:.1f}",
-                            (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                            (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             else:
-                cv2.putText(frame, "Baseline: not set", (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 2)
+                cv2.putText(frame, "Baseline: not set", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 2)
 
+            # 显示各个警报距上次触发时间
             time_since_axis = current_time - state.last_alert_times['axis']
-            cv2.putText(frame, f"Last axis alert: {time_since_axis:.1f}s ago",
-                        (10, 155), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            time_since_vertical = current_time - state.last_alert_times['vertical_offset']
+            cv2.putText(frame, f"Last axis: {time_since_axis:.1f}s  Last vert: {time_since_vertical:.1f}s",
+                        (10, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
             # 显示久坐计时
             if state.sit_start_time is not None:
@@ -375,6 +432,8 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
+    # 关闭弹窗线程（可选）
+    break_manager.close()
 
 if __name__ == "__main__":
     main()
